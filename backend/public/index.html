@@ -400,11 +400,26 @@
 
   // ---------- Actions ----------
 
+  // Whoever creates a trip is its admin -- can add/remove members directly
+  // and remove any destination, not just ones they added themselves. Admin
+  // status lives on the group itself (creatorId), not per-device, but is
+  // only ever *recognized* on the device that created the trip (myId ===
+  // creatorId) -- there's no login, so it can't be proven from anywhere else.
+  // Trips saved before this feature have no creatorId; treat whoever is
+  // first in the member list as admin for those, same as creation already
+  // implies today.
+  function isAdmin(g, myId){
+    if(!g || !myId) return false;
+    const creatorId = g.creatorId || (g.members[0] && g.members[0].id);
+    return myId === creatorId;
+  }
+
   async function createTrip(tripName, myName, myCity, myAirport){
     const me = {id: uid(), name: myName, city: myCity, airport: normalizeAirports(myAirport)};
     const group = {
       name: tripName,
       createdAt: Date.now(),
+      creatorId: me.id,
       members: [me],
       destinations: [],
       estimates: {}
@@ -441,6 +456,32 @@
   async function refreshGroup(){
     const g = await loadGroup(state.code);
     if(g) setState({group:g});
+  }
+
+  // Admin-only: add someone to the trip directly (e.g. a friend who won't
+  // be opening the app themselves) instead of them using the join code.
+  // Doesn't touch this device's own myId -- the admin is still themselves,
+  // not the person they just added.
+  async function addMember(name, city, airport){
+    const g = {...state.group};
+    const member = {id: uid(), name, city, airport: normalizeAirports(airport)};
+    g.members = [...g.members, member];
+    await saveGroup(state.code, g);
+    setState({group:g});
+  }
+
+  // Admin-only. Also drops that member's price estimates so they don't
+  // linger as orphaned data tied to a member id that no longer exists.
+  async function removeMember(memberId){
+    const g = {...state.group};
+    g.members = g.members.filter(m=>m.id!==memberId);
+    const estimates = {};
+    Object.entries(g.estimates).forEach(([key, val])=>{
+      if(!key.endsWith(':'+memberId)) estimates[key] = val;
+    });
+    g.estimates = estimates;
+    await saveGroup(state.code, g);
+    setState({group:g});
   }
 
   async function addDestination(name, startDate, endDate, notes, airport){
@@ -796,15 +837,49 @@
     wrap.appendChild(topbar);
 
     // members
+    const admin = isAdmin(g, state.myId);
+    const creatorId = g.creatorId || (g.members[0] && g.members[0].id);
     const memberCard = el('div','tp-card');
     memberCard.innerHTML = `<h2><span class="num">${g.members.length}</span> In the group</h2>`;
     const chips = el('div','tp-members');
     g.members.forEach(m=>{
       const chip = el('div','tp-chip');
-      chip.innerHTML = `<span class="tp-avatar" style="background:${avatarColor(m.id)}">${initials(m.name)}</span><span>${escapeHtml(m.name)} · ${escapeHtml(m.city)}${m.airport ? ' ('+escapeHtml(m.airport)+')' : ''}</span>`;
+      const isCreator = m.id === creatorId;
+      chip.innerHTML = `<span class="tp-avatar" style="background:${avatarColor(m.id)}">${initials(m.name)}</span><span>${escapeHtml(m.name)} · ${escapeHtml(m.city)}${m.airport ? ' ('+escapeHtml(m.airport)+')' : ''}${isCreator ? ' · admin' : ''}</span>`;
+      if(admin && !isCreator){
+        const rm = el('button', null, '×');
+        rm.title = 'Remove '+m.name;
+        rm.style.cssText = 'background:none;border:none;color:var(--paper-dim);cursor:pointer;font-size:15px;line-height:1;padding:0 0 0 2px;';
+        rm.onclick = ()=>{ if(confirm(`Remove ${m.name} from the trip?`)) removeMember(m.id); };
+        chip.appendChild(rm);
+      }
       chips.appendChild(chip);
     });
     memberCard.appendChild(chips);
+
+    if(admin){
+      const addMemberWrap = el('div'); addMemberWrap.style.cssText='margin-top:14px;padding-top:14px;border-top:1px solid var(--line);';
+      const amLabel = el('div', null, 'Add someone directly (admin)');
+      amLabel.style.cssText = 'font-size:12px;font-weight:700;color:var(--paper-dim);text-transform:uppercase;letter-spacing:.03em;margin-bottom:8px;';
+      addMemberWrap.appendChild(amLabel);
+      const amRow1 = el('div','tp-row');
+      const amName = field('Name','e.g. Jordan');
+      const amCity = field('Home city','e.g. Denver, CO');
+      amRow1.appendChild(amName.wrap); amRow1.appendChild(amCity.wrap);
+      addMemberWrap.appendChild(amRow1);
+      const amAirport = field('Airport(s), optional','e.g. DEN, or EWR,PHL');
+      amAirport.input.style.textTransform='uppercase';
+      addMemberWrap.appendChild(amAirport.wrap);
+      const amBtn = el('button','tp-btn small','+ Add member');
+      amBtn.onclick = ()=>{
+        if(!amName.input.value.trim() || !amCity.input.value.trim()) return;
+        addMember(amName.input.value.trim(), amCity.input.value.trim(), amAirport.input.value.trim());
+        amName.input.value=''; amCity.input.value=''; amAirport.input.value='';
+      };
+      addMemberWrap.appendChild(amBtn);
+      memberCard.appendChild(addMemberWrap);
+    }
+
     const shareNote = el('div','tp-loading','Share the code above so the rest of the group can join. Real flight prices are used automatically when airport codes are set — otherwise you\'ll see an AI estimate.');
     shareNote.style.marginTop='10px';
     memberCard.appendChild(shareNote);
@@ -925,14 +1000,14 @@
     const fairestId = ranked.find(r=>r.allKnown)?.dest.id;
 
     ranked.forEach(r=>{
-      destSection.appendChild(renderDestCard(r, g, fairestId));
+      destSection.appendChild(renderDestCard(r, g, fairestId, admin));
     });
 
     wrap.appendChild(destSection);
     return wrap;
   }
 
-  function renderDestCard(r, g, fairestId){
+  function renderDestCard(r, g, fairestId, admin){
     const d = r.dest;
     const card = el('div','tp-dest-card');
     const isFairest = d.id===fairestId;
@@ -984,11 +1059,14 @@
     const btn = el('button','tp-btn small', state.busyDest===d.id ? 'Pricing…' : 'Get flight prices');
     btn.disabled = state.busyDest===d.id;
     btn.onclick = ()=> estimateForDestination(d);
-    const rmBtn = el('button','tp-btn ghost small','Remove');
-    rmBtn.style.marginLeft='8px';
-    rmBtn.onclick = ()=> removeDestination(d.id);
     const btnWrap = el('div'); btnWrap.style.display='flex';
-    btnWrap.appendChild(btn); btnWrap.appendChild(rmBtn);
+    btnWrap.appendChild(btn);
+    if(admin){
+      const rmBtn = el('button','tp-btn ghost small','Remove');
+      rmBtn.style.marginLeft='8px';
+      rmBtn.onclick = ()=> removeDestination(d.id);
+      btnWrap.appendChild(rmBtn);
+    }
     totals.appendChild(btnWrap);
     totalsWrap.appendChild(totals);
 
