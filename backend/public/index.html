@@ -317,6 +317,16 @@
     return name.trim().split(/\s+/).map(w=>w[0]).slice(0,2).join('').toUpperCase();
   }
 
+  // Accepts one or more comma-separated 3-letter airport codes, e.g.
+  // "ewr, phl" -> "EWR,PHL" -- lets someone list every airport near them
+  // (or every airport serving a destination) in one field. SerpApi/Google
+  // Flights takes a comma-joined departure_id/arrival_id natively and
+  // returns the cheapest fare across all of them as a single search, so
+  // this needs no change on the pricing side, just letting people type it.
+  function normalizeAirports(s){
+    return (s||'').toUpperCase().split(',').map(x=>x.trim()).filter(Boolean).join(',');
+  }
+
   function hashStr(id){
     let h = 0;
     for(let i=0;i<id.length;i++) h = (h*31 + id.charCodeAt(i)) >>> 0;
@@ -391,7 +401,7 @@
   // ---------- Actions ----------
 
   async function createTrip(tripName, myName, myCity, myAirport){
-    const me = {id: uid(), name: myName, city: myCity, airport: (myAirport||'').toUpperCase()};
+    const me = {id: uid(), name: myName, city: myCity, airport: normalizeAirports(myAirport)};
     const group = {
       name: tripName,
       createdAt: Date.now(),
@@ -419,7 +429,7 @@
     code = code.trim().toUpperCase();
     const g = await loadGroup(code);
     if(!g){ setState({error:"Couldn't find a trip with that code. Double check it and try again."}); return; }
-    const me = {id: uid(), name: myName, city: myCity, airport: (myAirport||'').toUpperCase()};
+    const me = {id: uid(), name: myName, city: myCity, airport: normalizeAirports(myAirport)};
     g.members.push(me);
     const ok = await saveGroup(code, g);
     if(!ok){ setState({error:"Couldn't join the trip just now — try again."}); return; }
@@ -435,7 +445,7 @@
 
   async function addDestination(name, startDate, endDate, notes, airport){
     const g = {...state.group};
-    const dest = {id: uid(), name, startDate, endDate, notes, airport: (airport||'').toUpperCase()};
+    const dest = {id: uid(), name, startDate, endDate, notes, airport: normalizeAirports(airport)};
     g.destinations = [...g.destinations, dest];
     await saveGroup(state.code, g);
     setState({group:g});
@@ -701,11 +711,10 @@
     const f1 = field('Trip name','e.g. Summer 2027 Meetup');
     const f2 = field('Your name','e.g. Jordan');
     const f3 = field('Your home city','e.g. Denver, CO');
-    const f4 = field('Nearest major airport (3-letter code)','e.g. DEN');
+    const f4 = field('Nearest major airport(s)','e.g. DEN, or EWR,PHL if a few are close');
     f4.input.style.textTransform='uppercase';
-    f4.input.maxLength = 3;
     card.appendChild(f1.wrap); card.appendChild(f2.wrap); card.appendChild(f3.wrap); card.appendChild(f4.wrap);
-    const hint = el('div','tp-loading','Airport code is optional but needed if you want real flight prices instead of AI estimates. Not sure? Search "[your city] airport code".');
+    const hint = el('div','tp-loading','Airport code is optional but needed for real flight prices instead of AI estimates. Near more than one? List them comma-separated (e.g. EWR,PHL) and we\'ll price the cheapest. Not sure? Search "[your city] airport code".');
     hint.style.marginBottom='10px';
     card.appendChild(hint);
 
@@ -735,11 +744,10 @@
     f0.input.style.textTransform='uppercase';
     const f1 = field('Your name','e.g. Priya');
     const f2 = field('Your home city','e.g. Austin, TX');
-    const f3 = field('Nearest major airport (3-letter code)','e.g. AUS');
+    const f3 = field('Nearest major airport(s)','e.g. AUS, or EWR,PHL if a few are close');
     f3.input.style.textTransform='uppercase';
-    f3.input.maxLength = 3;
     card.appendChild(f0.wrap); card.appendChild(f1.wrap); card.appendChild(f2.wrap); card.appendChild(f3.wrap);
-    const hint = el('div','tp-loading','Airport code is optional but needed if the group wants real flight prices instead of AI estimates.');
+    const hint = el('div','tp-loading','Airport code is optional but needed for real flight prices instead of AI estimates. Near more than one? List them comma-separated (e.g. EWR,PHL) and we\'ll price the cheapest.');
     hint.style.marginBottom='10px';
     card.appendChild(hint);
 
@@ -807,9 +815,8 @@
     addCard.innerHTML = `<h2><span class="num">+</span> Suggest a destination</h2>`;
     const nameRow = el('div','tp-row');
     const fName = field('Destination','e.g. Asheville, NC');
-    const fAirport = field('Airport code (optional)','e.g. AVL');
+    const fAirport = field('Airport code(s), optional','e.g. AVL, or MIA,FLL if a few serve it');
     fAirport.input.style.textTransform='uppercase';
-    fAirport.input.maxLength = 3;
     nameRow.appendChild(fName.wrap); nameRow.appendChild(fAirport.wrap);
     addCard.appendChild(nameRow);
     const row = el('div','tp-row');
