@@ -173,6 +173,22 @@
     font-size:10px;font-weight:800;
   }
 
+  .tp-chip-x{
+    border:none;background:transparent;color:var(--paper-dim);cursor:pointer;
+    font-size:16px;line-height:1;padding:0 2px;margin-left:2px;border-radius:50%;
+  }
+  .tp-chip-x:hover{color:#C0392B;}
+  .tp-chip-you{font-size:10.5px;font-weight:700;color:var(--green);margin-left:2px;}
+  .tp-admin-box{
+    margin-top:14px;padding:14px;border:1px dashed var(--line);border-radius:12px;
+  }
+  .tp-admin-box h3{margin:0 0 8px;font-size:13px;font-weight:700;}
+  .tp-admin-box details{margin-top:10px;font-size:12.5px;color:var(--paper-dim);}
+  .tp-admin-box summary{cursor:pointer;font-weight:700;}
+  .tp-admin-key{
+    font-family:ui-monospace,Menlo,monospace;font-size:12px;word-break:break-all;
+    background:var(--panel-2);padding:8px 10px;border-radius:8px;margin:8px 0;color:var(--ink,#123645);
+  }
   .tp-dest-card{
     border:1px solid var(--line);border-radius:16px;background:var(--panel);
     margin-bottom:18px;overflow:hidden;box-shadow:0 8px 22px -10px rgba(18,54,69,0.2);
@@ -301,6 +317,9 @@
     code: null,
     group: null, // {name, members, destinations, estimates}
     myId: null,
+    isAdmin: false,
+    hasAdmin: false,
+    memberError: null,
     error: null,
     busyDest: null,
     suggestions: [],
@@ -351,14 +370,31 @@
 
   function getMyId(code){ return localStorage.getItem('tp-myid-'+code); }
   function setMyId(code, id){ localStorage.setItem('tp-myid-'+code, id); }
+  // The admin key (given once to whoever creates the trip) is stored per trip
+  // on that device. The server checks it on every admin action.
+  function getAdminToken(code){ return localStorage.getItem('tp-admin-'+code) || ''; }
+  function setAdminToken(code, token){ localStorage.setItem('tp-admin-'+code, token); }
+  function forgetTrip(code){
+    localStorage.removeItem('tp-myid-'+code);
+    if(localStorage.getItem('tp-last-code')===code) localStorage.removeItem('tp-last-code');
+  }
 
-  async function loadGroup(code){
+  // Returns { group, hasAdmin, isAdmin } or null if the trip can't be loaded.
+  async function loadTrip(code, tokenOverride){
     try{
-      const res = await fetch('/api/trips/'+encodeURIComponent(code));
+      const token = tokenOverride || getAdminToken(code);
+      const res = await fetch('/api/trips/'+encodeURIComponent(code), {
+        headers: token ? {'X-Admin-Token': token} : {}
+      });
       if(!res.ok) return null;
       const data = await res.json();
-      return data.group || null;
+      if(!data.group) return null;
+      return {group: data.group, hasAdmin: !!data.hasAdmin, isAdmin: !!data.isAdmin};
     }catch(e){ return null; }
+  }
+  async function loadGroup(code){
+    const t = await loadTrip(code);
+    return t ? t.group : null;
   }
   async function saveGroup(code, group){
     try{
@@ -375,11 +411,17 @@
     try{
       const last = localStorage.getItem('tp-last-code');
       if(last){
-        const g = await loadGroup(last);
-        if(g){
+        const t = await loadTrip(last);
+        if(t){
           const myId = getMyId(last);
-          if(myId && g.members.find(m=>m.id===myId)){
-            setState({view:'trip', code:last, group:g, myId});
+          if(myId && t.group.members.find(m=>m.id===myId)){
+            setState({view:'trip', code:last, group:t.group, myId, isAdmin:t.isAdmin, hasAdmin:t.hasAdmin});
+            return;
+          }
+          if(myId){
+            // This browser remembered a member the admin has since removed.
+            forgetTrip(last);
+            setState({view:'landing', error:'The trip admin removed you from "'+t.group.name+'". Ask them to add you back, or join again with the code.'});
             return;
           }
         }
@@ -408,8 +450,9 @@
       if(!res.ok) throw new Error();
       const data = await res.json();
       setMyId(data.code, me.id);
+      if(data.adminToken) setAdminToken(data.code, data.adminToken);
       localStorage.setItem('tp-last-code', data.code);
-      setState({view:'trip', code:data.code, group:data.group, myId: me.id});
+      setState({view:'trip', code:data.code, group:data.group, myId: me.id, isAdmin: !!data.adminToken, hasAdmin:true, error:null});
     }catch(e){
       setState({error:"Couldn't create the trip just now — try again."});
     }
@@ -417,20 +460,117 @@
 
   async function joinTrip(code, myName, myCity, myAirport){
     code = code.trim().toUpperCase();
-    const g = await loadGroup(code);
-    if(!g){ setState({error:"Couldn't find a trip with that code. Double check it and try again."}); return; }
-    const me = {id: uid(), name: myName, city: myCity, airport: (myAirport||'').toUpperCase()};
-    g.members.push(me);
-    const ok = await saveGroup(code, g);
-    if(!ok){ setState({error:"Couldn't join the trip just now — try again."}); return; }
-    setMyId(code, me.id);
-    localStorage.setItem('tp-last-code', code);
-    setState({view:'trip', code, group:g, myId: me.id, error:null});
+    const t = await loadTrip(code);
+    if(!t){ setState({error:"Couldn't find a trip with that code. Double check it and try again."}); return; }
+    // Coming back to a trip this browser is already in (e.g. after "Switch trip")
+    // reopens it instead of adding the same person a second time.
+    const existingId = getMyId(code);
+    if(existingId && t.group.members.find(m=>m.id===existingId)){
+      localStorage.setItem('tp-last-code', code);
+      setState({view:'trip', code, group:t.group, myId:existingId, isAdmin:t.isAdmin, hasAdmin:t.hasAdmin, error:null});
+      return;
+    }
+    try{
+      const res = await fetch('/api/trips/'+encodeURIComponent(code)+'/members', {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({name:myName, city:myCity, airport:myAirport})
+      });
+      const data = await res.json().catch(()=>({}));
+      if(!res.ok) throw new Error(data.error || '');
+      setMyId(code, data.member.id);
+      localStorage.setItem('tp-last-code', code);
+      setState({view:'trip', code, group:data.group, myId:data.member.id, isAdmin:t.isAdmin, hasAdmin:t.hasAdmin, error:null});
+    }catch(e){
+      setState({error: e.message || "Couldn't join the trip just now — try again."});
+    }
   }
 
   async function refreshGroup(){
-    const g = await loadGroup(state.code);
-    if(g) setState({group:g});
+    if(!state.code) return;
+    const t = await loadTrip(state.code);
+    if(!t) return;
+    if(state.myId && !t.group.members.find(m=>m.id===state.myId)){
+      const name = t.group.name;
+      forgetTrip(state.code);
+      setState({view:'landing', code:null, group:null, myId:null, isAdmin:false, hasAdmin:false,
+        error:'The trip admin removed you from "'+name+'". Ask them to add you back, or join again with the code.'});
+      return;
+    }
+    setState({group:t.group, isAdmin:t.isAdmin, hasAdmin:t.hasAdmin});
+  }
+
+  // Leaves this trip's screen without deleting anything, so you can start or join another.
+  function switchTrip(){
+    localStorage.removeItem('tp-last-code');
+    setState({view:'landing', code:null, group:null, myId:null, isAdmin:false, hasAdmin:false, error:null, memberError:null});
+  }
+
+  // ----- Admin actions (the server rejects these without the admin key) -----
+  async function adminAddMember(name, city, airport){
+    setState({memberError:null});
+    try{
+      const res = await fetch('/api/trips/'+encodeURIComponent(state.code)+'/members', {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({name, city, airport})
+      });
+      const data = await res.json().catch(()=>({}));
+      if(!res.ok) throw new Error(data.error || 'Could not add that person');
+      setState({group:data.group});
+      return true;
+    }catch(e){
+      setState({memberError:e.message});
+      return false;
+    }
+  }
+
+  async function adminRemoveMember(member){
+    if(!window.confirm('Remove '+member.name+' from this trip? Their saved flight prices are removed too.')) return;
+    setState({memberError:null});
+    try{
+      const res = await fetch('/api/trips/'+encodeURIComponent(state.code)+'/members/'+encodeURIComponent(member.id), {
+        method:'DELETE',
+        headers:{'X-Admin-Token': getAdminToken(state.code)}
+      });
+      const data = await res.json().catch(()=>({}));
+      if(!res.ok) throw new Error(data.error || 'Could not remove that person');
+      setState({group:data.group});
+    }catch(e){
+      setState({memberError:e.message});
+    }
+  }
+
+  // For trips created before admin controls existed: the person who created the
+  // trip (first member) can take admin once.
+  async function claimAdmin(){
+    setState({memberError:null});
+    try{
+      const res = await fetch('/api/trips/'+encodeURIComponent(state.code)+'/claim-admin', {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({memberId: state.myId})
+      });
+      const data = await res.json().catch(()=>({}));
+      if(!res.ok) throw new Error(data.error || 'Could not claim admin');
+      setAdminToken(state.code, data.adminToken);
+      setState({isAdmin:true, hasAdmin:true});
+    }catch(e){
+      setState({memberError:e.message});
+    }
+  }
+
+  // Use the admin key from another device.
+  async function restoreAdmin(key){
+    key = (key||'').trim();
+    if(!key){ setState({memberError:'Paste the admin key first.'}); return; }
+    const t = await loadTrip(state.code, key);
+    if(t && t.isAdmin){
+      setAdminToken(state.code, key);
+      setState({isAdmin:true, hasAdmin:true, group:t.group, memberError:null});
+    }else{
+      setState({memberError:"That admin key doesn't match this trip."});
+    }
   }
 
   async function addDestination(name, startDate, endDate, notes, airport){
@@ -668,6 +808,7 @@
     c2.appendChild(b2);
 
     choice.appendChild(c1); choice.appendChild(c2);
+    if(state.error){ const e = el('div','tp-err', escapeHtml(state.error)); e.style.marginBottom='14px'; wrap.appendChild(e); }
     wrap.appendChild(choice);
     return wrap;
   }
@@ -785,6 +926,10 @@
     const topbar = el('div','tp-topbar');
     topbar.innerHTML = `<div class="disp" style="font-size:20px;font-weight:500;">${escapeHtml(g.name)}</div>
       <div class="tp-code-badge">${state.code}</div>`;
+    const switchBtn = el('button','tp-btn ghost small','Switch trip');
+    switchBtn.title = 'Go back to the start page to create or join a different trip';
+    switchBtn.onclick = switchTrip;
+    topbar.appendChild(switchBtn);
     wrap.appendChild(topbar);
 
     // members
@@ -793,13 +938,74 @@
     const chips = el('div','tp-members');
     g.members.forEach(m=>{
       const chip = el('div','tp-chip');
-      chip.innerHTML = `<span class="tp-avatar" style="background:${avatarColor(m.id)}">${initials(m.name)}</span><span>${escapeHtml(m.name)} · ${escapeHtml(m.city)}${m.airport ? ' ('+escapeHtml(m.airport)+')' : ''}</span>`;
+      const isMe = m.id===state.myId;
+      chip.innerHTML = `<span class="tp-avatar" style="background:${avatarColor(m.id)}">${initials(m.name)}</span><span>${escapeHtml(m.name)} · ${escapeHtml(m.city)}${m.airport ? ' ('+escapeHtml(m.airport)+')' : ''}</span>${isMe ? '<span class="tp-chip-you">you</span>' : ''}`;
+      if(state.isAdmin && !isMe){
+        const x = el('button','tp-chip-x','×');
+        x.title = 'Remove '+m.name;
+        x.setAttribute('aria-label','Remove '+m.name);
+        x.onclick = ()=> adminRemoveMember(m);
+        chip.appendChild(x);
+      }
       chips.appendChild(chip);
     });
     memberCard.appendChild(chips);
     const shareNote = el('div','tp-loading','Share the code above so the rest of the group can join. Real flight prices are used automatically when airport codes are set — otherwise you\'ll see an AI estimate.');
     shareNote.style.marginTop='10px';
     memberCard.appendChild(shareNote);
+
+    if(state.memberError){ memberCard.appendChild(el('div','tp-err', escapeHtml(state.memberError))); }
+
+    const refreshBtn = el('button','tp-btn ghost small','Refresh');
+    refreshBtn.style.marginTop='10px';
+    refreshBtn.title = 'Check for people who joined or were removed';
+    refreshBtn.onclick = refreshGroup;
+    memberCard.appendChild(refreshBtn);
+
+    if(state.isAdmin){
+      const box = el('div','tp-admin-box');
+      box.innerHTML = '<h3>You\'re the trip admin — add or remove people</h3>';
+      const row1 = el('div','tp-row');
+      const aName = field('Name','e.g. Jordan');
+      const aCity = field('Home city','e.g. Denver, CO');
+      row1.appendChild(aName.wrap); row1.appendChild(aCity.wrap);
+      const aAir = field('Airport (optional)','e.g. DEN');
+      aAir.input.maxLength = 3;
+      aAir.input.style.textTransform='uppercase';
+      const addBtn = el('button','tp-btn small','Add person');
+      addBtn.onclick = async ()=>{
+        const ok = await adminAddMember(aName.input.value.trim(), aCity.input.value.trim(), aAir.input.value.trim());
+        if(ok){ aName.input.value=''; aCity.input.value=''; aAir.input.value=''; }
+      };
+      box.appendChild(row1); box.appendChild(aAir.wrap); box.appendChild(addBtn);
+
+      const keyDetails = document.createElement('details');
+      keyDetails.innerHTML = '<summary>Admin key (to manage from another device)</summary>';
+      const keyText = el('div','tp-admin-key', escapeHtml(getAdminToken(state.code)));
+      const copyBtn = el('button','tp-btn ghost small','Copy key');
+      copyBtn.onclick = ()=>{ try{ navigator.clipboard.writeText(getAdminToken(state.code)); copyBtn.textContent='Copied'; }catch(e){ copyBtn.textContent='Select and copy it manually'; } };
+      const warn = el('div',null,'Anyone with this key can remove people from the trip. Keep it private.');
+      keyDetails.appendChild(keyText); keyDetails.appendChild(copyBtn); keyDetails.appendChild(warn);
+      box.appendChild(keyDetails);
+      memberCard.appendChild(box);
+    } else if(!state.hasAdmin && g.members[0] && g.members[0].id===state.myId){
+      const box = el('div','tp-admin-box');
+      box.innerHTML = '<h3>This trip was created before admin controls existed</h3><div class="tp-loading">Since you created it, you can become its admin. Do this soon — until someone claims admin, anyone with the trip code could.</div>';
+      const claim = el('button','tp-btn small','Make me the admin');
+      claim.style.marginTop='10px';
+      claim.onclick = claimAdmin;
+      box.appendChild(claim);
+      memberCard.appendChild(box);
+    } else if(state.hasAdmin){
+      const det = document.createElement('details');
+      det.className = 'tp-admin-box';
+      det.innerHTML = '<summary>I\'m the admin on another device</summary>';
+      const keyField = field('Admin key','Paste the key from the admin\'s device');
+      const useBtn = el('button','tp-btn small','Use admin key');
+      useBtn.onclick = ()=> restoreAdmin(keyField.input.value);
+      det.appendChild(keyField.wrap); det.appendChild(useBtn);
+      memberCard.appendChild(det);
+    }
     wrap.appendChild(memberCard);
 
     // add destination
@@ -1030,6 +1236,11 @@
   function escapeHtml(s){
     const d = document.createElement('div'); d.textContent = s; return d.innerHTML;
   }
+
+  // People join and get removed from other devices; catch up when you come back to this tab.
+  document.addEventListener('visibilitychange', ()=>{
+    if(document.visibilityState==='visible' && state.view==='trip') refreshGroup();
+  });
 
   init();
 })();
