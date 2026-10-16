@@ -4,6 +4,7 @@ const express = require('express');
 const cors = require('cors');
 const db = require('./db');
 const { cacheKey, pickReasonableFlight } = require('./lib/pricing');
+const members = require('./lib/members');
 
 const app = express();
 app.use(cors()); // allow calls from the trip-planner front end (any origin)
@@ -150,6 +151,14 @@ function genCode() {
   return c;
 }
 
+// Admin = whoever created the trip. Creating a trip returns a random admin
+// token once; the browser keeps it and sends it back in the X-Admin-Token
+// header. Only a hash is stored. Removing people requires the token, checked
+// here on the server -- hiding a button in the page is not protection.
+function adminTokenFrom(req) {
+  return req.get('x-admin-token') || '';
+}
+
 app.post('/api/trips', async (req, res) => {
   const { group } = req.body || {};
   if (!group) return res.status(400).json({ error: 'group is required' });
@@ -160,30 +169,125 @@ app.post('/api/trips', async (req, res) => {
       if (!(await db.tripExists(candidate))) code = candidate;
     }
     if (!code) return res.status(500).json({ error: 'Could not generate a unique trip code, try again' });
-    await db.insertTrip(code, group);
-    res.json({ code, group });
+    const adminToken = members.newAdminToken();
+    await db.insertTrip(code, group, members.hashToken(adminToken));
+    res.json({ code, group, adminToken });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
 
+// hasAdmin: the trip has an admin at all (older trips don't until claimed).
+// isAdmin: the token sent with this request is the admin's.
 app.get('/api/trips/:code', async (req, res) => {
   try {
-    const group = await db.getTrip(req.params.code.toUpperCase());
-    if (!group) return res.status(404).json({ error: 'Trip not found' });
-    res.json({ group });
+    const row = await db.getTripRow(req.params.code.toUpperCase());
+    if (!row) return res.status(404).json({ error: 'Trip not found' });
+    res.json({
+      group: row.data,
+      hasAdmin: !!row.adminHash,
+      isAdmin: members.tokenMatches(adminTokenFrom(req), row.adminHash),
+    });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
 
+// Saves destinations, prices, notes, etc. The member list is never taken from
+// the browser here -- see the member routes below.
 app.put('/api/trips/:code', async (req, res) => {
   const { group } = req.body || {};
   if (!group) return res.status(400).json({ error: 'group is required' });
   try {
-    const ok = await db.updateTrip(req.params.code.toUpperCase(), group);
-    if (!ok) return res.status(404).json({ error: 'Trip not found' });
-    res.json({ group });
+    let saved = null;
+    const r = await db.withTrip(req.params.code.toUpperCase(), (existing) => {
+      saved = members.mergeForUpdate(existing, group);
+      return { data: saved };
+    });
+    if (r.notFound) return res.status(404).json({ error: 'Trip not found' });
+    res.json({ group: saved });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Anyone with the trip code can add themselves. The admin uses this same route
+// to add a friend who isn't using the app.
+app.post('/api/trips/:code/members', async (req, res) => {
+  const cleaned = members.cleanMember(req.body);
+  if (cleaned.error) return res.status(400).json({ error: cleaned.error });
+  try {
+    let saved = null;
+    const r = await db.withTrip(req.params.code.toUpperCase(), (existing) => {
+      saved = members.addMember(existing, cleaned.member);
+      return { data: saved };
+    });
+    if (r.notFound) return res.status(404).json({ error: 'Trip not found' });
+    res.json({ member: cleaned.member, group: saved });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Admin only.
+app.delete('/api/trips/:code/members/:memberId', async (req, res) => {
+  try {
+    let status = 200;
+    let body = null;
+    const r = await db.withTrip(req.params.code.toUpperCase(), (existing, adminHash) => {
+      if (!members.tokenMatches(adminTokenFrom(req), adminHash)) {
+        status = 403;
+        body = { error: 'Only the trip admin can remove people' };
+        return {};
+      }
+      const out = members.removeMember(existing, req.params.memberId);
+      if (out.error === 'not_found') {
+        status = 404;
+        body = { error: 'That person is not in this trip' };
+        return {};
+      }
+      if (out.error === 'last_member') {
+        status = 400;
+        body = { error: "Can't remove the only person in the trip" };
+        return {};
+      }
+      body = { group: out.group };
+      return { data: out.group };
+    });
+    if (r.notFound) return res.status(404).json({ error: 'Trip not found' });
+    res.status(status).json(body);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// One-time migration for trips created before admin controls existed: the
+// person who created the trip (the first member) can claim admin. This only
+// works while the trip has no admin, and the first member's id is visible to
+// everyone in the trip, so claim it right after deploying.
+app.post('/api/trips/:code/claim-admin', async (req, res) => {
+  const { memberId } = req.body || {};
+  try {
+    let status = 200;
+    let body = null;
+    const r = await db.withTrip(req.params.code.toUpperCase(), (existing, adminHash) => {
+      if (adminHash) {
+        status = 409;
+        body = { error: 'This trip already has an admin' };
+        return {};
+      }
+      const first = (existing.members || [])[0];
+      if (!first || !memberId || first.id !== memberId) {
+        status = 403;
+        body = { error: 'Only the person who created the trip can claim admin' };
+        return {};
+      }
+      const adminToken = members.newAdminToken();
+      body = { adminToken };
+      return { adminHash: members.hashToken(adminToken) };
+    });
+    if (r.notFound) return res.status(404).json({ error: 'Trip not found' });
+    res.status(status).json(body);
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
